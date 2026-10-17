@@ -1,0 +1,20 @@
+# name: benchmark/parquet/encryption/bloom_filter_point_lookup_encrypted.benchmark
+# description: Point lookup on a missing value where only bloom filters can prune row groups (encrypted)
+# group: [encryption]
+
+name Bloom filter point lookup (encrypted)
+group parquet
+subgroup encryption
+
+require parquet
+
+load
+SET force_mbedtls_unsafe = 'true';
+PRAGMA add_parquet_key('key256', '01234567891123450123456789112345');
+COPY (SELECT (hash(i) % 20000)::BIGINT * 2 AS k, i FROM range(10000000) t(i)) TO '${BENCHMARK_DIR}/bloom_lookup_encrypted.parquet' (ROW_GROUP_SIZE 100000, DICTIONARY_SIZE_LIMIT 100000, ENCRYPTION_CONFIG {footer_key: 'key256'});
+
+run
+SELECT count(*) FROM read_parquet('${BENCHMARK_DIR}/bloom_lookup_encrypted.parquet', encryption_config={footer_key: 'key256'}) WHERE k = 12345;
+
+result I
+0
