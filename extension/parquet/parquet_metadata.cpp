@@ -13,6 +13,7 @@
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/common/multi_file/multi_file_list.hpp"
 #include "parquet_reader.hpp"
+#include "parquet_crypto.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/assert.hpp"
@@ -80,6 +81,7 @@ struct ParquetMetadataFilePaths {
 
 struct ParquetMetaDataBindData : public TableFunctionData {
 	unique_ptr<ParquetMetadataFilePaths> file_paths;
+	shared_ptr<ParquetEncryptionConfig> encryption_config;
 
 	//! The file list is consumed by the first execution
 	bool SupportStatementCache() const override {
@@ -174,9 +176,11 @@ struct ParquetMetadataLocalState : public LocalTableFunctionState {
 	idx_t row_idx = 0;
 	idx_t total_rows = 0;
 	optional_idx file_idx;
+	shared_ptr<ParquetEncryptionConfig> encryption_config;
 
 	void Initialize(ClientContext &context, OpenFileInfo &file_info, idx_t next_file_idx) {
 		ParquetOptions parquet_options(context);
+		parquet_options.encryption_config = encryption_config;
 		reader = make_uniq<ParquetReader>(context, file_info, parquet_options);
 		processor->Initialize(context, *reader);
 		total_rows = processor->TotalRowCount(*reader);
@@ -931,9 +935,13 @@ void ParquetBloomProbeProcessor::ReadRow(vector<reference<Vector>> &output, idx_
 	D_ASSERT(!probe_constant.IsNull());
 
 	auto &column_schema = reader.root_schema->children[probe_column_idx.GetIndex()];
-	auto bloom_excludes =
-	    hash_strategy && ParquetStatisticsUtils::BloomFilterExcludes(*filter, column.meta_data, *protocol, *allocator,
-	                                                                 column_schema, *hash_strategy);
+	optional<ParquetBloomFilterDecryption> decryption;
+	if (reader.metadata->IsEncrypted()) {
+		decryption.emplace(ParquetBloomFilterDecryption {reader, row_idx, probe_column_idx.GetIndex()});
+	}
+	auto bloom_excludes = hash_strategy && ParquetStatisticsUtils::BloomFilterExcludes(
+	                                           *filter, column.meta_data, *protocol, *allocator, column_schema,
+	                                           *hash_strategy, decryption ? &*decryption : nullptr);
 
 	output[0].get().Append(Value(reader.file.path));
 	output[1].get().Append(Value::BIGINT(NumericCast<int64_t>(row_idx)));
@@ -1079,6 +1087,11 @@ unique_ptr<FunctionData> ParquetMetaDataOperator::Bind(ClientContext &context, T
 		probe_bind_data->probe_constant = input.inputs[2];
 		result = std::move(probe_bind_data);
 	}
+	for (auto &kv : input.named_parameters) {
+		if (kv.first == "encryption_config") {
+			result->encryption_config = ParquetEncryptionConfig::Create(context, kv.second);
+		}
+	}
 
 	result->file_paths = make_uniq<ParquetMetadataFilePaths>();
 	result->file_paths->file_list = multi_file_reader->CreateFileList(context, input.inputs[0], glob_input);
@@ -1102,6 +1115,7 @@ unique_ptr<LocalTableFunctionState> ParquetMetaDataOperator::InitLocal(Execution
                                                                        GlobalTableFunctionState *global_state) {
 	auto &bind_data = input.bind_data->Cast<ParquetMetaDataBindData>();
 	auto res = make_uniq<ParquetMetadataLocalState>();
+	res->encryption_config = bind_data.encryption_config;
 	switch (OP_TYPE) {
 	case ParquetMetadataOperatorType::META_DATA:
 		res->processor = make_uniq<ParquetRowGroupMetadataProcessor>();
@@ -1196,6 +1210,11 @@ double ParquetMetaDataOperator::Progress(ClientContext &context, const FunctionD
 	return global_data.GetProgress() * 100.0;
 }
 
+static void AddEncryptionParameter(TableFunction &table_function) {
+	table_function.GetSignature().WithTypedKwargs(
+	    "options", [](TypedKwargs &options) { options.Add("encryption_config", LogicalTypeId::ANY); });
+}
+
 ParquetMetaDataFunction::ParquetMetaDataFunction()
     : TableFunction("parquet_metadata", FunctionSignature().AddPositionalOnly("path", LogicalType::VARCHAR),
                     ParquetMetaDataOperator::Function,
@@ -1204,6 +1223,7 @@ ParquetMetaDataFunction::ParquetMetaDataFunction()
                     ParquetMetaDataOperator::InitLocal<ParquetMetadataOperatorType::META_DATA>) {
 	table_scan_progress = ParquetMetaDataOperator::Progress;
 	get_partition_data = ParquetMetaDataOperator::GetPartitionData;
+	AddEncryptionParameter(*this);
 }
 
 ParquetSchemaFunction::ParquetSchemaFunction()
@@ -1214,6 +1234,7 @@ ParquetSchemaFunction::ParquetSchemaFunction()
                     ParquetMetaDataOperator::InitLocal<ParquetMetadataOperatorType::SCHEMA>) {
 	table_scan_progress = ParquetMetaDataOperator::Progress;
 	get_partition_data = ParquetMetaDataOperator::GetPartitionData;
+	AddEncryptionParameter(*this);
 }
 
 ParquetKeyValueMetadataFunction::ParquetKeyValueMetadataFunction()
@@ -1224,6 +1245,7 @@ ParquetKeyValueMetadataFunction::ParquetKeyValueMetadataFunction()
                     ParquetMetaDataOperator::InitLocal<ParquetMetadataOperatorType::KEY_VALUE_META_DATA>) {
 	table_scan_progress = ParquetMetaDataOperator::Progress;
 	get_partition_data = ParquetMetaDataOperator::GetPartitionData;
+	AddEncryptionParameter(*this);
 }
 
 ParquetFileMetadataFunction::ParquetFileMetadataFunction()
@@ -1234,6 +1256,7 @@ ParquetFileMetadataFunction::ParquetFileMetadataFunction()
                     ParquetMetaDataOperator::InitLocal<ParquetMetadataOperatorType::FILE_META_DATA>) {
 	table_scan_progress = ParquetMetaDataOperator::Progress;
 	get_partition_data = ParquetMetaDataOperator::GetPartitionData;
+	AddEncryptionParameter(*this);
 }
 
 ParquetBloomProbeFunction::ParquetBloomProbeFunction()
@@ -1248,6 +1271,7 @@ ParquetBloomProbeFunction::ParquetBloomProbeFunction()
                     ParquetMetaDataOperator::InitLocal<ParquetMetadataOperatorType::BLOOM_PROBE>) {
 	table_scan_progress = ParquetMetaDataOperator::Progress;
 	get_partition_data = ParquetMetaDataOperator::GetPartitionData;
+	AddEncryptionParameter(*this);
 }
 
 ParquetFullMetadataFunction::ParquetFullMetadataFunction()
@@ -1258,5 +1282,6 @@ ParquetFullMetadataFunction::ParquetFullMetadataFunction()
                     ParquetMetaDataOperator::InitLocal<ParquetMetadataOperatorType::FULL_METADATA>) {
 	table_scan_progress = ParquetMetaDataOperator::Progress;
 	get_partition_data = ParquetMetaDataOperator::GetPartitionData;
+	AddEncryptionParameter(*this);
 }
 } // namespace duckdb

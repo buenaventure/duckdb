@@ -1438,10 +1438,8 @@ void ParquetWriter::InitializeSchemaFromPreparedRowGroup(const PreparedRowGroup 
 void ParquetWriter::Finalize() {
 	InitializeSchemaElements();
 
-	// dump the bloom filters right before footer, not if stuff is encrypted
-
+	// dump the bloom filters right before footer
 	for (auto &bloom_filter_entry : bloom_filters) {
-		D_ASSERT(!options.encryption_config);
 		// write nonsense bloom filter header
 		duckdb_parquet::BloomFilterHeader filter_header;
 		auto bloom_filter_bytes = bloom_filter_entry.bloom_filter->Get();
@@ -1459,11 +1457,12 @@ void ParquetWriter::Finalize() {
 
 		auto bloom_filter_header_size = Write(filter_header);
 		// write actual data
-		WriteData(bloom_filter_bytes->ptr, bloom_filter_bytes->len);
+		auto bloom_filter_data_size =
+		    WriteData(bloom_filter_bytes->ptr, NumericCast<uint32_t>(bloom_filter_bytes->len));
 
 		column_chunk.meta_data.__isset.bloom_filter_length = true;
 		column_chunk.meta_data.bloom_filter_length =
-		    NumericCast<int32_t>(bloom_filter_header_size + bloom_filter_bytes->len);
+		    NumericCast<int32_t>(bloom_filter_header_size + bloom_filter_data_size);
 	}
 
 	const auto metadata_start_offset = writer->GetTotalWritten();
@@ -1516,9 +1515,6 @@ GeoParquetFileMetadata &ParquetWriter::GetGeoParquetData() {
 }
 
 void ParquetWriter::BufferBloomFilter(idx_t col_idx, unique_ptr<ParquetBloomFilter> bloom_filter) {
-	if (options.encryption_config) {
-		return;
-	}
 	ParquetBloomFilterEntry new_entry;
 	new_entry.bloom_filter = std::move(bloom_filter);
 	new_entry.column_idx = col_idx;

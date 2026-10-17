@@ -19,6 +19,7 @@
 #include "duckdb/common/typedefs.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/unique_ptr.hpp"
+#include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/common/vector.hpp"
 
 namespace duckdb_apache {
@@ -38,8 +39,16 @@ class Statistics;
 
 namespace duckdb {
 class Allocator;
+class ParquetReader;
 class TableFilter;
 enum class LogicalTypeId : uint8_t;
+
+//! Locates an encrypted bloom filter within its file, which determines its additional authenticated data
+struct ParquetBloomFilterDecryption {
+	const ParquetReader &reader;
+	idx_t row_group_idx;
+	idx_t column_idx;
+};
 
 using duckdb_parquet::ColumnChunk;
 using duckdb_parquet::SchemaElement;
@@ -77,9 +86,11 @@ struct ParquetStatisticsUtils {
 	GetBloomFilterHashStrategy(const ParquetColumnSchema &schema,
 	                           ParquetIntervalBloomFilterVersion interval_bloom_filter_version);
 
+	//! Pass decryption for encrypted files - the bloom filter header and bitset are then encrypted too
 	static bool BloomFilterExcludes(const TableFilter &filter, const duckdb_parquet::ColumnMetaData &column_meta_data,
 	                                duckdb_apache::thrift::protocol::TProtocol &file_proto, Allocator &allocator,
-	                                const ParquetColumnSchema &schema, ParquetBloomFilterHashStrategy hash_strategy);
+	                                const ParquetColumnSchema &schema, ParquetBloomFilterHashStrategy hash_strategy,
+	                                optional_ptr<const ParquetBloomFilterDecryption> decryption = nullptr);
 
 	static unique_ptr<BaseStatistics> CreateNumericStats(const LogicalType &type, const ParquetColumnSchema &schema_ele,
 	                                                     const duckdb_parquet::Statistics &parquet_stats);

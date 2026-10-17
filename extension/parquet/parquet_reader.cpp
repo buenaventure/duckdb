@@ -1955,12 +1955,17 @@ void ParquetReader::PrepareRowGroupBuffer(ClientContext &context, ParquetReaderS
 				auto hash_strategy = bloom_reader ? ParquetStatisticsUtils::GetBloomFilterHashStrategy(
 				                                        bloom_reader->Schema(), interval_bloom_filter_version)
 				                                  : nullopt;
+				optional<ParquetBloomFilterDecryption> decryption;
+				if (bloom_reader && metadata->IsEncrypted()) {
+					decryption.emplace(
+					    ParquetBloomFilterDecryption {*this, state.group_index, bloom_reader->ColumnIndex()});
+				}
 				if (check_bloom_filter && bloom_reader && bloom_filter &&
 				    bloom_reader->Schema().schema_type == ParquetColumnSchemaType::COLUMN &&
 				    bloom_reader->ColumnIndex() < group.columns.size() && hash_strategy &&
 				    ParquetStatisticsUtils::BloomFilterExcludes(
 				        *bloom_filter, group.columns[bloom_reader->ColumnIndex()].meta_data, *state.thrift_file_proto,
-				        allocator, bloom_reader->Schema(), *hash_strategy)) {
+				        allocator, bloom_reader->Schema(), *hash_strategy, decryption ? &*decryption : nullptr)) {
 					prune_result = FilterPropagateResult::FILTER_ALWAYS_FALSE;
 				}
 			}

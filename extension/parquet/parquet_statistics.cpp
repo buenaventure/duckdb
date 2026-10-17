@@ -29,6 +29,8 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "reader/uuid_column_reader.hpp"
 #include "column_reader.hpp"
+#include "parquet_crypto.hpp"
+#include "parquet_reader.hpp"
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/constants.hpp"
 #include "duckdb/common/enums/expression_type.hpp"
@@ -1160,7 +1162,8 @@ bool ParquetStatisticsUtils::BloomFilterExcludes(const TableFilter &duckdb_filte
                                                  const duckdb_parquet::ColumnMetaData &column_meta_data,
                                                  TProtocol &file_proto, Allocator &allocator,
                                                  const ParquetColumnSchema &schema,
-                                                 ParquetBloomFilterHashStrategy hash_strategy) {
+                                                 ParquetBloomFilterHashStrategy hash_strategy,
+                                                 optional_ptr<const ParquetBloomFilterDecryption> decryption) {
 	if (!HasFilterConstants(duckdb_filter, hash_strategy) || !column_meta_data.__isset.bloom_filter_offset ||
 	    column_meta_data.bloom_filter_offset <= 0) {
 		return false;
@@ -1189,8 +1192,21 @@ bool ParquetStatisticsUtils::BloomFilterExcludes(const TableFilter &duckdb_filte
 	}
 
 	duckdb_parquet::BloomFilterHeader filter_header;
-	// TODO the bloom filter could be encrypted, too, so need to double check that this is NOT the case
-	filter_header.read(&file_proto);
+	CryptoMetaData bitset_aad(allocator);
+	idx_t bitset_overhead = 0;
+	if (decryption) {
+		auto &reader = decryption->reader;
+		auto file_aad = ParquetReader::GetUniqueFileIdentifier(reader.metadata->crypto_metadata->encryption_algorithm);
+		auto row_group_ordinal = NumericCast<int16_t>(decryption->row_group_idx);
+		auto column_ordinal = NumericCast<int16_t>(decryption->column_idx);
+		CryptoMetaData header_aad(allocator);
+		header_aad.Initialize(file_aad, row_group_ordinal, column_ordinal, ParquetCrypto::BLOOM_FILTER_HEADER);
+		bitset_aad.Initialize(file_aad, row_group_ordinal, column_ordinal, ParquetCrypto::BLOOM_FILTER_BITSET);
+		reader.ReadEncrypted(filter_header, file_proto, header_aad);
+		bitset_overhead = ParquetCrypto::LENGTH_BYTES + ParquetCrypto::NONCE_BYTES + ParquetCrypto::TAG_BYTES;
+	} else {
+		filter_header.read(&file_proto);
+	}
 	if (!filter_header.algorithm.__isset.BLOCK || !filter_header.compression.__isset.UNCOMPRESSED ||
 	    !filter_header.hash.__isset.XXHASH) {
 		return false;
@@ -1203,20 +1219,26 @@ bool ParquetStatisticsUtils::BloomFilterExcludes(const TableFilter &duckdb_filte
 	if (bloom_filter_data_size % sizeof(ParquetBloomBlock) != 0) {
 		return false;
 	}
-	if (bloom_filter_data_start < bloom_filter_start || bloom_filter_data_size > transport.GetSize() ||
-	    bloom_filter_data_start > transport.GetSize() - bloom_filter_data_size) {
+	auto bloom_filter_stored_size = bloom_filter_data_size + bitset_overhead;
+	if (bloom_filter_data_start < bloom_filter_start || bloom_filter_stored_size > transport.GetSize() ||
+	    bloom_filter_data_start > transport.GetSize() - bloom_filter_stored_size) {
 		return false;
 	}
 	if (bloom_filter_length > 0) {
 		auto bloom_filter_header_size = bloom_filter_data_start - bloom_filter_start;
 		if (bloom_filter_header_size > bloom_filter_length ||
-		    bloom_filter_data_size != bloom_filter_length - bloom_filter_header_size) {
+		    bloom_filter_stored_size != bloom_filter_length - bloom_filter_header_size) {
 			return false;
 		}
 	}
 
 	auto new_buffer = make_uniq<ResizeableBuffer>(allocator, bloom_filter_data_size);
-	transport.read(new_buffer->ptr, UnsafeNumericCast<uint32_t>(bloom_filter_data_size));
+	if (decryption) {
+		decryption->reader.ReadDataEncrypted(file_proto, new_buffer->ptr,
+		                                     UnsafeNumericCast<uint32_t>(bloom_filter_data_size), bitset_aad);
+	} else {
+		transport.read(new_buffer->ptr, UnsafeNumericCast<uint32_t>(bloom_filter_data_size));
+	}
 	ParquetBloomFilter bloom_filter(std::move(new_buffer));
 	return ApplyBloomFilter(duckdb_filter, bloom_filter, schema, hash_strategy);
 }

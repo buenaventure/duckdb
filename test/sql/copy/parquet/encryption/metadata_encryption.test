@@ -1,0 +1,124 @@
+# name: test/sql/copy/parquet/encryption/metadata_encryption.test
+# description: Test the parquet metadata functions and bloom filters on encrypted Parquet files
+# group: [encryption]
+
+require parquet
+
+# parquet keys are not persisted across restarts
+require noforcestorage
+
+statement ok
+SET force_mbedtls_unsafe = 'true'
+
+statement ok
+PRAGMA add_parquet_key('key128', '0123456789112345')
+
+statement ok
+PRAGMA add_parquet_key('other_key', 'abcdefghijklmnop')
+
+statement ok
+COPY (SELECT (r1.range * 10)::BIGINT r, 'string_' || r::VARCHAR r_string
+      FROM range(100) r1, range(1000) ORDER BY r)
+TO '{TEST_DIR}/encrypted_bloom.parquet' (ENCRYPTION_CONFIG {footer_key: 'key128'}, ROW_GROUP_SIZE 10000,
+                                         DICTIONARY_SIZE_LIMIT 1000);
+
+# without a key, the metadata functions report the file as encrypted
+foreach func parquet_metadata parquet_schema parquet_kv_metadata parquet_file_metadata parquet_full_metadata
+
+statement error
+SELECT * FROM {func}('{TEST_DIR}/encrypted_bloom.parquet')
+----
+Invalid Input Error: File '{TEST_DIR}/encrypted_bloom.parquet' is encrypted, but 'encryption_config' was not set
+
+statement ok
+SELECT * FROM {func}('{TEST_DIR}/encrypted_bloom.parquet', encryption_config={footer_key: 'key128'})
+
+statement error
+SELECT * FROM {func}('{TEST_DIR}/encrypted_bloom.parquet', encryption_config={footer_key: 'other_key'})
+----
+Invalid Input Error: Computed AES tag differs from read AES tag, are you using the right key?
+
+statement error
+SELECT * FROM {func}('{TEST_DIR}/encrypted_bloom.parquet', encryption_config={footer_key: 'nonexistant'})
+----
+Binder Error: No key with name "nonexistant" exists
+
+endloop
+
+statement error
+SELECT * FROM parquet_bloom_probe('{TEST_DIR}/encrypted_bloom.parquet', 'r', 201)
+----
+Invalid Input Error: File '{TEST_DIR}/encrypted_bloom.parquet' is encrypted, but 'encryption_config' was not set
+
+query II
+SELECT num_rows, num_row_groups FROM parquet_file_metadata('{TEST_DIR}/encrypted_bloom.parquet', encryption_config={footer_key: 'key128'})
+----
+100000	10
+
+query I
+SELECT name FROM parquet_schema('{TEST_DIR}/encrypted_bloom.parquet', encryption_config={footer_key: 'key128'}) ORDER BY ALL
+----
+duckdb_schema
+r
+r_string
+
+# bloom filters are written for encrypted files too
+query III
+SELECT column_id, BOOL_AND(bloom_filter_offset > 4), BOOL_AND(bloom_filter_length > 1)
+FROM parquet_metadata('{TEST_DIR}/encrypted_bloom.parquet', encryption_config={footer_key: 'key128'})
+GROUP BY column_id ORDER BY column_id
+----
+0	true	true
+1	true	true
+
+# this value is not in the domain but within min/max
+query I
+SELECT BOOL_AND(bloom_filter_excludes) FROM parquet_bloom_probe('{TEST_DIR}/encrypted_bloom.parquet', 'r', '201', encryption_config={footer_key: 'key128'})
+----
+true
+
+query I
+SELECT BOOL_AND(bloom_filter_excludes) FROM parquet_bloom_probe('{TEST_DIR}/encrypted_bloom.parquet', 'r_string', 'string_201', encryption_config={footer_key: 'key128'})
+----
+true
+
+# values that are present are never excluded
+query II
+SELECT row_group_id, bloom_filter_excludes FROM parquet_bloom_probe('{TEST_DIR}/encrypted_bloom.parquet', 'r', 210, encryption_config={footer_key: 'key128'})
+WHERE NOT bloom_filter_excludes
+----
+2	false
+
+# the scan prunes row groups with the encrypted bloom filters
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM read_parquet('{TEST_DIR}/encrypted_bloom.parquet', encryption_config={footer_key: 'key128'}) WHERE r = 201;
+----
+analyzed_plan	<REGEX>:(?s).*Row Groups Scanned: 0 / 10.*
+
+query I
+SELECT count(*) FROM read_parquet('{TEST_DIR}/encrypted_bloom.parquet', encryption_config={footer_key: 'key128'}) WHERE r = 210;
+----
+1000
+
+query I
+SELECT count(*) FROM read_parquet('{TEST_DIR}/encrypted_bloom.parquet', encryption_config={footer_key: 'key128'}) WHERE r_string = 'string_210';
+----
+1000
+
+# the metadata functions accept globs and lists of encrypted files
+statement ok
+COPY (SELECT 42 i) TO '{TEST_DIR}/encrypted_small.parquet' (ENCRYPTION_CONFIG {footer_key: 'key128'})
+
+query I
+SELECT count(*) FROM parquet_file_metadata(['{TEST_DIR}/encrypted_bloom.parquet', '{TEST_DIR}/encrypted_small.parquet'], encryption_config={footer_key: 'key128'})
+----
+2
+
+# setting a key for an unencrypted file is an error, as in read_parquet
+statement ok
+COPY (SELECT 42 i) TO '{TEST_DIR}/unencrypted.parquet'
+
+statement error
+SELECT * FROM parquet_metadata('{TEST_DIR}/unencrypted.parquet', encryption_config={footer_key: 'key128'})
+----
+Invalid Input Error: File '{TEST_DIR}/unencrypted.parquet' is not encrypted, but 'encryption_config' was set
